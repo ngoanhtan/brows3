@@ -156,6 +156,7 @@ export interface Profile {
   name: string;
   credential_type: CredentialType;
   region?: string;
+  buckets?: string[];
   is_default: boolean;
   created_at?: string;
   updated_at?: string;
@@ -267,16 +268,16 @@ export const bucketApi = {
     await invoke<void>('put_bucket_policy', { bucketName, bucketRegion, policy, expectedPolicy, expectedProfileId });
   },
 
-  async listBuckets(): Promise<BucketInfo[]> {
-    return invoke<BucketInfo[]>('list_buckets');
+  async listBuckets(expectedProfileId?: string): Promise<BucketInfo[]> {
+    return invoke<BucketInfo[]>('list_buckets', { expectedProfileId });
   },
 
-  async listBucketsWithRegions(): Promise<BucketWithRegion[]> {
-    return invoke<BucketWithRegion[]>('list_buckets_with_regions');
+  async listBucketsWithRegions(expectedProfileId?: string): Promise<BucketWithRegion[]> {
+    return invoke<BucketWithRegion[]>('list_buckets_with_regions', { expectedProfileId });
   },
 
-  async getBucketRegion(bucketName: string): Promise<string> {
-    return invoke<string>('get_bucket_region', { bucketName });
+  async getBucketRegion(bucketName: string, expectedProfileId?: string): Promise<string> {
+    return invoke<string>('get_bucket_region', { bucketName, expectedProfileId });
   },
 
   async refreshS3Client(): Promise<void> {

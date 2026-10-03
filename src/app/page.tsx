@@ -32,6 +32,7 @@ import {
   FolderOpen as FolderOpenIcon,
   MoreVert as MoreVertIcon,
   Add as AddIcon,
+  Edit as EditIcon,
 } from '@mui/icons-material';
 import { useProfileStore } from '@/store/profileStore';
 import { useBuckets } from '@/hooks/useBuckets';
@@ -39,6 +40,7 @@ import { useHistoryStore } from '@/store/historyStore';
 import { useAppStore } from '@/store/appStore';
 import { toast } from '@/store/toastStore';
 import BucketManagementDialog, { type BucketAction } from '@/components/dialogs/BucketManagementDialog';
+import ProfileDialog from '@/components/profile/ProfileDialog';
 
 function HomeContent() {
   const router = useRouter();
@@ -54,6 +56,7 @@ function HomeContent() {
   const [searchQuery, setSearchQuery] = useState('');
   const deferredSearchQuery = useDeferredValue(searchQuery);
   const [s3UriInput, setS3UriInput] = useState('');
+  const [profileDialogOpen, setProfileDialogOpen] = useState(false);
   
   const activeProfile = profiles.find((p) => p.id === activeProfileId);
 
@@ -223,18 +226,34 @@ function HomeContent() {
     
     if (filteredBuckets.length === 0) {
       return (
-        <Box sx={{ textAlign: 'center', py: 8, bgcolor: 'action.hover', borderRadius: 2, border: '1px dashed', borderColor: 'divider' }}>
+        <Box sx={{ textAlign: 'center', py: 8, bgcolor: 'action.hover', borderRadius: 2, border: '1px dashed', borderColor: 'divider', px: 2 }}>
           <FolderOpenIcon sx={{ fontSize: 60, color: 'text.secondary', mb: 2, opacity: 0.5 }} />
           <Typography variant="h6" color="text.secondary">
             {searchQuery ? 'No buckets match your search' : 'No Buckets Found'}
           </Typography>
-          <Button 
-            startIcon={<RefreshIcon />} 
-            onClick={() => refresh()} 
-            sx={{ mt: 2 }}
-          >
-            Refresh List
-          </Button>
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 1, maxWidth: 480, mx: 'auto' }}>
+            {searchQuery
+              ? 'Try adjusting your search query.'
+              : 'If your credentials lack permission to list all buckets, you can specify your bucket name(s) directly in your profile connection.'}
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1.5, justifyContent: 'center', mt: 3, flexWrap: 'wrap' }}>
+            <Button 
+              variant="outlined"
+              startIcon={<RefreshIcon />} 
+              onClick={() => refresh()} 
+            >
+              Refresh List
+            </Button>
+            {activeProfile && (
+              <Button
+                variant="contained"
+                startIcon={<EditIcon />}
+                onClick={() => setProfileDialogOpen(true)}
+              >
+                Configure Profile Buckets
+              </Button>
+            )}
+          </Box>
         </Box>
       );
     }
@@ -416,6 +435,16 @@ function HomeContent() {
   
   return (
     <Box sx={{ p: 1, mt: 1 }}>
+      {profileDialogOpen && activeProfile && (
+        <ProfileDialog
+          open={profileDialogOpen}
+          onClose={() => {
+            setProfileDialogOpen(false);
+            refresh();
+          }}
+          editProfile={activeProfile}
+        />
+      )}
       {bucketAction && bucketAction.profileId === activeProfileId && <BucketManagementDialog key={`${bucketAction.mode}-${bucketAction.bucket || ''}-${bucketAction.profileId}`} action={bucketAction} onClose={() => setBucketAction(null)} />}
       <Menu anchorEl={bucketMenu?.anchor} open={!!bucketMenu && bucketMenu.profileId === activeProfileId} onClose={() => setBucketMenu(null)}>
         <MenuItem onClick={() => {

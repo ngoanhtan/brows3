@@ -17,16 +17,25 @@ pub struct BucketWithRegion {
 /// List all accessible S3 buckets
 #[tauri::command]
 pub async fn list_buckets(
+    expected_profile_id: Option<String>,
     profile_state: State<'_, ProfileState>,
     s3_state: State<'_, S3State>,
 ) -> Result<Vec<BucketInfo>, String> {
     // Get active profile
     let profile_manager = profile_state.read().await;
-    let active_profile = profile_manager
-        .get_active_profile()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No active profile selected".to_string())?;
+    let target_profile = if let Some(ref id) = expected_profile_id {
+        profile_manager.get_profile(id).await.ok()
+    } else {
+        None
+    };
+    let active_profile = match target_profile {
+        Some(p) => p,
+        None => profile_manager
+            .get_active_profile()
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No active profile selected".to_string())?,
+    };
 
     drop(profile_manager);
 
@@ -40,26 +49,72 @@ pub async fn list_buckets(
     drop(s3_manager);
 
     // List buckets
-    let buckets = s3::client::list_buckets(&client)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut discovered = match s3::client::list_buckets(&client).await {
+        Ok(b) => b,
+        Err(err) => {
+            let err_msg = err.to_string();
+            let is_access_denied = err_msg.contains("AccessDenied")
+                || err_msg.contains("403")
+                || err_msg.contains("Access Denied")
+                || err_msg.contains("Forbidden")
+                || err_msg.contains("MethodNotAllowed")
+                || err_msg.contains("NotImplemented");
 
-    Ok(buckets)
+            if is_access_denied || !active_profile.buckets.is_empty() {
+                log::warn!(
+                    "list_buckets permission denied for profile '{}', returning configured or empty bucket list: {}",
+                    active_profile.name,
+                    err_msg
+                );
+                Vec::new()
+            } else {
+                return Err(err_msg);
+            }
+        }
+    };
+
+    if !active_profile.buckets.is_empty() {
+        let existing: std::collections::HashSet<String> =
+            discovered.iter().map(|b| b.name.clone()).collect();
+        for custom_name in &active_profile.buckets {
+            if !existing.contains(custom_name) {
+                discovered.push(crate::s3::BucketInfo {
+                    name: custom_name.clone(),
+                    region: Some(active_profile.effective_region()),
+                    creation_date: None,
+                    object_count: None,
+                    total_size: None,
+                    total_size_formatted: None,
+                });
+            }
+        }
+    }
+
+    Ok(discovered)
 }
 
 /// List buckets with their regions
 #[tauri::command]
 pub async fn list_buckets_with_regions(
+    expected_profile_id: Option<String>,
     profile_state: State<'_, ProfileState>,
     s3_state: State<'_, S3State>,
 ) -> Result<Vec<BucketWithRegion>, String> {
     // Get active profile
     let profile_manager = profile_state.read().await;
-    let active_profile = profile_manager
-        .get_active_profile()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No active profile selected".to_string())?;
+    let target_profile = if let Some(ref id) = expected_profile_id {
+        profile_manager.get_profile(id).await.ok()
+    } else {
+        None
+    };
+    let active_profile = match target_profile {
+        Some(p) => p,
+        None => profile_manager
+            .get_active_profile()
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No active profile selected".to_string())?,
+    };
 
     drop(profile_manager);
 
@@ -71,11 +126,6 @@ pub async fn list_buckets_with_regions(
         .map_err(|e| e.to_string())?
         .clone();
     drop(s3_manager);
-
-    // List buckets
-    let buckets = s3::client::list_buckets(&client)
-        .await
-        .map_err(|e| e.to_string())?;
 
     // For custom endpoints (non-AWS providers like Linode, DigitalOcean, MinIO, etc.),
     // the GetBucketLocation API is often unsupported and causes "dispatch failure" errors.
@@ -84,10 +134,55 @@ pub async fn list_buckets_with_regions(
         &active_profile.credential_type,
         crate::credentials::CredentialType::CustomEndpoint { .. }
     );
-    let profile_region = active_profile
-        .region
-        .clone()
-        .unwrap_or_else(|| "us-east-1".to_string());
+    let profile_region = active_profile.effective_region();
+
+    // List buckets
+    let mut buckets = match s3::client::list_buckets(&client).await {
+        Ok(b) => b,
+        Err(err) => {
+            let err_msg = err.to_string();
+            let is_access_denied = err_msg.contains("AccessDenied")
+                || err_msg.contains("403")
+                || err_msg.contains("Access Denied")
+                || err_msg.contains("Forbidden")
+                || err_msg.contains("MethodNotAllowed")
+                || err_msg.contains("NotImplemented");
+
+            if is_access_denied || !active_profile.buckets.is_empty() {
+                log::warn!(
+                    "list_buckets permission denied for profile '{}', using configured bucket list: {}",
+                    active_profile.name,
+                    err_msg
+                );
+                Vec::new()
+            } else if is_custom_endpoint && err_msg.contains("dispatch failure") {
+                return Err(format!(
+                    "Could not connect to custom S3 endpoint. Please verify the endpoint URL, region, and network connectivity. Error: {}",
+                    err_msg
+                ));
+            } else {
+                return Err(err_msg);
+            }
+        }
+    };
+
+    // Merge any explicitly configured profile buckets
+    if !active_profile.buckets.is_empty() {
+        let existing: std::collections::HashSet<String> =
+            buckets.iter().map(|b| b.name.clone()).collect();
+        for custom_name in &active_profile.buckets {
+            if !existing.contains(custom_name) {
+                buckets.push(crate::s3::BucketInfo {
+                    name: custom_name.clone(),
+                    region: Some(profile_region.clone()),
+                    creation_date: None,
+                    object_count: None,
+                    total_size: None,
+                    total_size_formatted: None,
+                });
+            }
+        }
+    }
 
     if is_custom_endpoint {
         // Skip GetBucketLocation entirely for custom endpoints
@@ -149,27 +244,34 @@ pub async fn list_buckets_with_regions(
 #[tauri::command]
 pub async fn get_bucket_region(
     bucket_name: String,
+    expected_profile_id: Option<String>,
     profile_state: State<'_, ProfileState>,
     s3_state: State<'_, S3State>,
 ) -> Result<String, String> {
     // Get active profile
     let profile_manager = profile_state.read().await;
-    let active_profile = profile_manager
-        .get_active_profile()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No active profile selected".to_string())?;
+    let target_profile = if let Some(ref id) = expected_profile_id {
+        profile_manager.get_profile(id).await.ok()
+    } else {
+        None
+    };
+    let active_profile = match target_profile {
+        Some(p) => p,
+        None => profile_manager
+            .get_active_profile()
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No active profile selected".to_string())?,
+    };
 
     drop(profile_manager);
+
+    let region = active_profile.effective_region();
 
     if matches!(
         &active_profile.credential_type,
         crate::credentials::CredentialType::CustomEndpoint { .. }
-    ) {
-        let region = active_profile
-            .region
-            .clone()
-            .unwrap_or_else(|| "us-east-1".to_string());
+    ) || active_profile.buckets.contains(&bucket_name) {
         let mut s3_manager = s3_state.write().await;
         s3_manager.set_bucket_region(&active_profile, &bucket_name, region.clone());
         return Ok(region);
@@ -185,9 +287,10 @@ pub async fn get_bucket_region(
     drop(s3_manager);
 
     // Get region
-    s3::client::get_bucket_region(&client, &bucket_name)
-        .await
-        .map_err(|e| e.to_string())
+    match s3::client::get_bucket_region(&client, &bucket_name).await {
+        Ok(r) => Ok(r),
+        Err(_) => Ok(region),
+    }
 }
 
 /// Refresh the S3 client (clear cache)

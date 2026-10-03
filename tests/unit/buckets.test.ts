@@ -71,3 +71,12 @@ test('bucket creation invalidation refreshes every discovery view once', async (
   expect(second.result.current.buckets[0]?.name).toBe('created');
   expect(bucketApi.listBucketsWithRegions).toHaveBeenCalledTimes(2);
 });
+
+test('parseBucketsInput splits, trims, removes empty items, and deduplicates bucket names', async () => {
+  const { parseBucketsInput } = await import('@/components/profile/ProfileDialog');
+  const input = ' alpha, beta \n gamma,alpha \n\n delta   beta ';
+  expect(parseBucketsInput(input)).toEqual(['alpha', 'beta', 'gamma', 'delta']);
+  expect(parseBucketsInput('')).toEqual([]);
+  expect(parseBucketsInput('   \n  ')).toEqual([]);
+});
+
