@@ -35,6 +35,7 @@ import {
   Cloud as CloudIcon,
   Dns as ProfileIcon,
   Public as RegionIcon,
+  Storage as StorageIcon,
 } from '@mui/icons-material';
 import { Profile, CredentialType, profileApi, TestConnectionResult, bucketApi, invalidateCache } from '@/lib/tauri';
 import { useProfileStore } from '@/store/profileStore';
@@ -67,6 +68,54 @@ const AWS_REGIONS = [
   'us-gov-east-1', 'us-gov-west-1',
 ];
 
+export function inferRegionFromEndpoint(endpointUrl: string): string | null {
+  const trimmed = endpointUrl.trim().toLowerCase();
+  if (!trimmed) return null;
+  const host = trimmed.replace(/^https?:\/\//, '').split('/')[0].split(':')[0];
+  if (!host) return null;
+
+  // Backblaze B2: s3.<region>.backblazeb2.com
+  const b2Match = host.match(/^s3\.([a-z0-9-]+)\.backblazeb2\.com$/);
+  if (b2Match) return b2Match[1];
+
+  // Wasabi: s3.<region>.wasabisys.com or s3.wasabisys.com (us-east-1)
+  const wasabiMatch = host.match(/^s3\.([a-z0-9-]+)\.wasabisys\.com$/);
+  if (wasabiMatch) return wasabiMatch[1];
+  if (host === 's3.wasabisys.com') return 'us-east-1';
+
+  // DigitalOcean Spaces: <region>.digitaloceanspaces.com
+  const doMatch = host.match(/^([a-z0-9-]+)\.digitaloceanspaces\.com$/);
+  if (doMatch) return doMatch[1];
+
+  // Linode Object Storage: <region>.linodeobjects.com
+  const linodeMatch = host.match(/^([a-z0-9-]+)\.linodeobjects\.com$/);
+  if (linodeMatch) return linodeMatch[1];
+
+  // Scaleway: s3.<region>.scw.cloud
+  const scwMatch = host.match(/^s3\.([a-z0-9-]+)\.scw\.cloud$/);
+  if (scwMatch) return scwMatch[1];
+
+  // Vultr: <region>.vultrobjects.com
+  const vultrMatch = host.match(/^([a-z0-9-]+)\.vultrobjects\.com$/);
+  if (vultrMatch) return vultrMatch[1];
+
+  // Cloudflare R2: <account_id>.r2.cloudflarestorage.com
+  if (host.endsWith('.r2.cloudflarestorage.com')) return 'auto';
+
+  return null;
+}
+
+export function parseBucketsInput(input: string): string[] {
+  return Array.from(
+    new Set(
+      input
+        .split(/[,\n\s]+/)
+        .map((b) => b.trim())
+        .filter((b) => b.length > 0)
+    )
+  );
+}
+
 type CredentialTypeKey = 'Environment' | 'SharedConfig' | 'Manual' | 'CustomEndpoint';
 
 type ProfileFormData = {
@@ -74,6 +123,7 @@ type ProfileFormData = {
   name: string;
   credentialType: CredentialTypeKey;
   region: string;
+  buckets: string;
   profileName: string;
   accessKeyId: string;
   secretAccessKey: string;
@@ -103,6 +153,7 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
     name: '',
     credentialType: 'Environment' as CredentialTypeKey,
     region: 'us-east-1',
+    buckets: '',
     profileName: 'default',
     accessKeyId: '',
     secretAccessKey: '',
@@ -178,6 +229,7 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
       name: '',
       credentialType: 'Environment',
       region: defaultRegion || 'us-east-1',
+      buckets: '',
       profileName: 'default',
       accessKeyId: '',
       secretAccessKey: '',
@@ -230,6 +282,7 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
       name: profile.name,
       credentialType: cred.type as CredentialTypeKey,
       region: profile.region || 'us-east-1',
+      buckets: (profile.buckets || []).join(', '),
       profileName: cred.type === 'SharedConfig' ? (cred.profile_name || 'default') : 'default',
       accessKeyId: 'access_key_id' in cred ? cred.access_key_id : '',
       secretAccessKey: 'secret_access_key' in cred ? cred.secret_access_key : '',
@@ -239,6 +292,24 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
 
   const handleCredentialTypeChange = (credentialType: CredentialTypeKey) => {
     updateField('credentialType', credentialType);
+  };
+
+  const handleEndpointUrlChange = (newUrl: string) => {
+    const inferred = inferRegionFromEndpoint(newUrl);
+    setFormData((prev) => {
+      const shouldUpdateRegion =
+        inferred &&
+        (!prev.region ||
+          prev.region === 'us-east-1' ||
+          prev.region === 'auto' ||
+          prev.region === defaultRegion);
+
+      return {
+        ...prev,
+        endpointUrl: newUrl,
+        ...(shouldUpdateRegion ? { region: inferred } : {}),
+      };
+    });
   };
 
   const handleFormCancel = () => {
@@ -290,12 +361,16 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
         name: formData.name || 'Test',
         credential_type: buildCredentialType(),
         region: formData.region,
+        buckets: parseBucketsInput(formData.buckets),
         is_default: false,
       };
       
       const result = await profileApi.testConnection(profile as Profile);
       if (requestId === testRequestIdRef.current) {
         setTestResult(result);
+        if (!result.success) {
+          setError(result.message);
+        }
       }
     } catch (err) {
       if (requestId === testRequestIdRef.current) {
@@ -344,6 +419,7 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
         public_urls: publicUrlSettings(formData.publicUrls),
         credential_type: buildCredentialType(),
         region: formData.region,
+        buckets: parseBucketsInput(formData.buckets),
         is_default: false,
       };
       
@@ -560,6 +636,14 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
                                       <RegionIcon sx={{ fontSize: 14 }} /> 
                                       <Typography variant="caption" sx={{ fontWeight: 700 }}>{profile.region || 'global'}</Typography>
                                   </Box>
+                                  {profile.buckets && profile.buckets.length > 0 && (
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, color: 'text.secondary', opacity: 0.8 }}>
+                                      <StorageIcon sx={{ fontSize: 14 }} /> 
+                                      <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                                        {profile.buckets.length} {profile.buckets.length === 1 ? 'bucket' : 'buckets'}
+                                      </Typography>
+                                    </Box>
+                                  )}
                               </Box>
                           }
                           secondaryTypographyProps={{ component: 'div' }}
@@ -615,7 +699,13 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
     </Fade>
   );
   
-  const renderForm = () => (
+  const renderForm = () => {
+    const inferredRegion =
+      formData.credentialType === 'CustomEndpoint'
+        ? inferRegionFromEndpoint(formData.endpointUrl)
+        : null;
+
+    return (
     <Fade in={mode !== 'list'}>
       <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3.5 }}>
         <TextField
@@ -736,9 +826,18 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
                   <TextField
                     label="Endpoint URL"
                     value={formData.endpointUrl}
-                    onChange={(e) => updateField('endpointUrl', e.target.value)}
+                    onChange={(e) => handleEndpointUrlChange(e.target.value)}
                     fullWidth
-                    placeholder="https://account-id.r2.cloudflarestorage.com"
+                    placeholder="https://s3.us-east-005.backblazeb2.com"
+                    helperText={
+                      inferredRegion ? (
+                        <Typography component="span" variant="caption" sx={{ color: 'success.main', fontWeight: 600 }}>
+                          Detected region: <strong>{inferredRegion}</strong> (SigV4 signing region automatically applied)
+                        </Typography>
+                      ) : (
+                        "e.g., Backblaze B2, Wasabi, Cloudflare R2, MinIO, Linode, DigitalOcean Spaces"
+                      )
+                    }
                     sx={{ '& .MuiOutlinedInput-root': { borderRadius: 1.5, bgcolor: 'background.paper', fontWeight: 600 } }}
                   />
                 )}
@@ -774,9 +873,24 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
               {...params}
               label="Default Region"
               fullWidth
+              helperText={
+                inferredRegion && formData.region === inferredRegion
+                  ? `Inferred automatically from custom endpoint URL (${inferredRegion})`
+                  : undefined
+              }
               sx={{ '& .MuiOutlinedInput-root': { borderRadius: 2, fontWeight: 600 } }}
             />
           )}
+        />
+
+        <TextField
+          label="Buckets (Optional)"
+          placeholder="e.g. my-bucket, team-data"
+          value={formData.buckets}
+          onChange={(e) => updateField('buckets', e.target.value)}
+          fullWidth
+          helperText="Specify bucket name(s) separated by commas or newlines if your credentials lack ListAllMyBuckets permission."
+          sx={{ '& .MuiOutlinedInput-root': { borderRadius: 2, fontWeight: 600 } }}
         />
         
         <PublicUrlFields value={formData.publicUrls} onChange={value => updateField('publicUrls', value)} />
@@ -802,13 +916,24 @@ export default function ProfileDialog({ open, onClose, editProfile }: ProfileDia
             )}
           </Box>
           
-          {error && (
+          {testResult && (
+            <Alert 
+              severity={testResult.success ? "success" : "error"} 
+              variant={testResult.success ? "standard" : "filled"} 
+              sx={{ borderRadius: 2, fontWeight: 600 }}
+            >
+              {testResult.message}
+            </Alert>
+          )}
+
+          {error && !testResult && (
             <Alert severity="error" variant="filled" sx={{ borderRadius: 2, fontWeight: 600 }}>{error}</Alert>
           )}
         </Box>
       </Box>
     </Fade>
   );
+  };
   
   return (
     <BaseDialog 

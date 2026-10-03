@@ -129,31 +129,96 @@ pub async fn test_connection(
 
     let client = crate::s3::client::client_from_sdk_config(&sdk_config, &profile);
 
-    // Test connection by listing buckets
+    // Test connection by listing buckets or verifying access to configured buckets
     match client.list_buckets().send().await {
         Ok(response) => {
-            let bucket_count = response.buckets().len();
+            let mut bucket_count = response.buckets().len();
+            let existing: std::collections::HashSet<_> = response
+                .buckets()
+                .iter()
+                .map(|b| b.name().unwrap_or_default())
+                .collect();
+            for b in &profile.buckets {
+                if !existing.contains(b.as_str()) {
+                    bucket_count += 1;
+                }
+            }
             Ok(TestConnectionResult {
                 success: true,
                 message: format!("Connected successfully! Found {} bucket(s)", bucket_count),
-                region: Some(
-                    profile
-                        .region
-                        .clone()
-                        .unwrap_or_else(|| "us-east-1".to_string()),
-                ),
+                region: Some(profile.effective_region()),
                 bucket_count: Some(bucket_count),
             })
         }
         Err(e) => {
-            let error_string = e.to_string();
+            let detailed_error = format!("{}", aws_sdk_s3::error::DisplayErrorContext(&e));
+
+            // If explicit bucket(s) were configured, test access directly to them
+            if !profile.buckets.is_empty() {
+                let mut accessible = 0;
+                let mut last_bucket_err = String::new();
+
+                for bucket_name in &profile.buckets {
+                    // Try to list objects (max_keys = 1) or head bucket
+                    let check = client
+                        .list_objects_v2()
+                        .bucket(bucket_name)
+                        .max_keys(1)
+                        .send()
+                        .await;
+
+                    match check {
+                        Ok(_) => {
+                            accessible += 1;
+                        }
+                        Err(b_err) => {
+                            if client.head_bucket().bucket(bucket_name).send().await.is_ok() {
+                                accessible += 1;
+                            } else {
+                                last_bucket_err =
+                                    format!("{}", aws_sdk_s3::error::DisplayErrorContext(&b_err));
+                            }
+                        }
+                    }
+                }
+
+                if accessible > 0 {
+                    return Ok(TestConnectionResult {
+                        success: true,
+                        message: format!(
+                            "Connected! Verified access to {} configured bucket(s): {}",
+                            accessible,
+                            profile.buckets.join(", ")
+                        ),
+                        region: Some(profile.effective_region()),
+                        bucket_count: Some(profile.buckets.len()),
+                    });
+                } else if !last_bucket_err.is_empty()
+                    && !last_bucket_err.contains("dispatch failure")
+                {
+                    return Ok(TestConnectionResult {
+                        success: false,
+                        message: format!(
+                            "Could not list all buckets ({}). Failed to access configured bucket '{}': {}",
+                            e.as_service_error().and_then(|s| s.code()).unwrap_or("AccessDenied"),
+                            profile.buckets[0],
+                            last_bucket_err
+                        ),
+                        region: None,
+                        bucket_count: None,
+                    });
+                }
+            }
 
             // Check for dispatch failure - common with S3-compatible providers
-            // when the endpoint URL is malformed or unreachable
-            if error_string.contains("dispatch failure") {
+            // when the endpoint URL is malformed, unreachable, or dropped by network/TLS
+            if detailed_error.contains("dispatch failure") {
                 return Ok(TestConnectionResult {
                     success: false,
-                    message: "Connection failed: Could not reach the endpoint. Please verify the endpoint URL is correct (e.g., https://us-east-1.linodeobjects.com) and that your network can reach it.".to_string(),
+                    message: format!(
+                        "Connection failed: Could not reach the endpoint. Please verify the endpoint URL, region, and network connectivity. (Details: {})",
+                        detailed_error
+                    ),
                     region: None,
                     bucket_count: None,
                 });
@@ -164,19 +229,19 @@ pub async fn test_connection(
             let message = s3_err.and_then(|s| s.message()).unwrap_or("No message");
 
             // If it's an AccessDenied, it means the CREDENTIALS are correct, but the user
-            // lacks permission to list all buckets. We can still consider this "connected".
+            // lacks permission to list all buckets.
             if code == "AccessDenied" || code == "403" {
                 return Ok(TestConnectionResult {
                     success: true,
-                    message: "Connected! (Note: You are authenticated, but lack permission to list all buckets. You may need to enter bucket names manually or use a direct link.)".to_string(),
-                    region: Some(profile.region.clone().unwrap_or_else(|| "us-east-1".to_string())),
-                    bucket_count: Some(0),
+                    message: "Connected! (Note: Authenticated, but your credentials lack permission to list all buckets. Add your bucket name(s) in the Buckets field to access them directly.)".to_string(),
+                    region: Some(profile.effective_region()),
+                    bucket_count: Some(profile.buckets.len()),
                 });
             }
 
             Ok(TestConnectionResult {
                 success: false,
-                message: format!("Connection failed: {}: {}", code, message),
+                message: format!("Connection failed: {}: {} (Details: {})", code, message, detailed_error),
                 region: None,
                 bucket_count: None,
             })

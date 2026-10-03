@@ -121,7 +121,9 @@ pub(crate) fn classify_acl_error(error: &str) -> Option<(&'static str, &'static 
     None
 }
 
-pub(crate) fn s3_error_message<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+pub(crate) fn s3_error_message<
+    E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + 'static,
+>(
     error: &aws_sdk_s3::error::SdkError<E>,
 ) -> String {
     match error.as_service_error() {
@@ -130,11 +132,11 @@ pub(crate) fn s3_error_message<E: aws_sdk_s3::error::ProvideErrorMetadata>(
             service.code().unwrap_or("S3Error"),
             service.message().unwrap_or("Request failed"),
         ),
-        None => error.to_string(),
+        None => format!("{}", aws_sdk_s3::error::DisplayErrorContext(error)),
     }
 }
 
-fn map_acl_error<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+fn map_acl_error<E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + 'static>(
     error: aws_sdk_s3::error::SdkError<E>,
 ) -> crate::error::AppError {
     let error_string = s3_error_message(&error);

@@ -16,9 +16,14 @@ const MAX_SORTED_CACHE_ITEMS: usize = 100_000;
 /// Many S3-compatible providers (Linode, DigitalOcean, etc.) may be configured
 /// without a scheme, causing the AWS SDK to fail with "dispatch failure".
 pub(crate) fn normalize_endpoint_url(url: &str) -> String {
-    let trimmed = url.trim();
+    let trimmed = url.trim().trim_end_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
+    } else if trimmed.starts_with("localhost")
+        || trimmed.starts_with("127.0.0.1")
+        || trimmed.starts_with("0.0.0.0")
+    {
+        format!("http://{}", trimmed)
     } else {
         format!("https://{}", trimmed)
     }
@@ -45,7 +50,9 @@ fn build_s3_config(sdk_config: &aws_config::SdkConfig, profile: &Profile) -> aws
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
     }
 
-    builder = builder.request_checksum_calculation(RequestChecksumCalculation::WhenRequired);
+    builder = builder
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(4))
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired);
 
     builder.build()
 }
@@ -57,8 +64,8 @@ pub(crate) async fn load_sdk_config(
     override_region: Option<String>,
 ) -> aws_config::SdkConfig {
     let region_str = override_region
-        .or_else(|| profile.region.clone())
-        .unwrap_or_else(|| "us-east-1".to_string());
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| profile.effective_region());
     let region = Region::new(region_str);
 
     match &profile.credential_type {
@@ -165,10 +172,7 @@ impl S3ClientManager {
 
     /// Get or create an S3 client for the given profile's default region
     pub async fn get_client(&mut self, profile: &Profile) -> Result<&Client> {
-        let region = profile
-            .region
-            .clone()
-            .unwrap_or_else(|| "us-east-1".to_string());
+        let region = profile.effective_region();
         self.get_client_for_region(profile, &region).await
     }
 
@@ -178,6 +182,11 @@ impl S3ClientManager {
         profile: &Profile,
         region: &str,
     ) -> Result<&Client> {
+        let region = if region.trim().is_empty() {
+            "us-east-1"
+        } else {
+            region.trim()
+        };
         let key = (profile.cache_identity(), region.to_string());
 
         if !self.clients.contains_key(&key) {
@@ -352,7 +361,7 @@ pub async fn list_buckets(client: &Client) -> Result<Vec<BucketInfo>> {
         .list_buckets()
         .send()
         .await
-        .map_err(|e| AppError::S3Error(e.to_string()))?;
+        .map_err(|e| AppError::S3Error(format!("{}", aws_sdk_s3::error::DisplayErrorContext(&e))))?;
 
     let buckets = response
         .buckets()
@@ -387,7 +396,8 @@ pub async fn get_bucket_region(client: &Client, bucket_name: &str) -> Result<Str
         Ok(Err(e)) => {
             return Err(AppError::S3Error(format!(
                 "GetBucketLocation failed for '{}': {}",
-                bucket_name, e
+                bucket_name,
+                aws_sdk_s3::error::DisplayErrorContext(&e)
             )));
         }
         Err(_) => {
@@ -473,6 +483,18 @@ mod tests {
         assert_eq!(
             normalize_endpoint_url("http://localhost:9000"),
             "http://localhost:9000"
+        );
+        assert_eq!(
+            normalize_endpoint_url("http://localhost:9000/"),
+            "http://localhost:9000"
+        );
+        assert_eq!(
+            normalize_endpoint_url("localhost:9000"),
+            "http://localhost:9000"
+        );
+        assert_eq!(
+            normalize_endpoint_url("127.0.0.1:9000/"),
+            "http://127.0.0.1:9000"
         );
     }
 

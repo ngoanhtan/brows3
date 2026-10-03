@@ -26,7 +26,7 @@ function fetchBucketsForProfile(profileId: string): Promise<BucketWithRegion[]> 
     return inflight;
   }
 
-  const request = bucketApi.listBucketsWithRegions().finally(() => {
+  const request = bucketApi.listBucketsWithRegions(profileId).finally(() => {
     if (bucketFetchPromises.get(profileId) === request) {
       bucketFetchPromises.delete(profileId);
     }

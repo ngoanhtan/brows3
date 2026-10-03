@@ -2,7 +2,7 @@ pub mod keychain;
 pub mod manager;
 
 pub use keychain::KeychainStorage;
-pub use manager::{CredentialType, Profile, ProfileManager};
+pub use manager::{infer_region_from_endpoint, CredentialType, Profile, ProfileManager};
 
 use crate::error::Result;
 use std::path::PathBuf;

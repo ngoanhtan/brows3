@@ -42,6 +42,8 @@ pub struct Profile {
     pub name: String,
     pub credential_type: CredentialType,
     pub region: Option<String>,
+    #[serde(default)]
+    pub buckets: Vec<String>,
     pub is_default: bool,
     #[serde(default)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -69,11 +71,108 @@ impl Profile {
             secret_ref: None,
             credential_type,
             region,
+            buckets: Vec::new(),
             is_default: false,
             created_at: Some(now),
             updated_at: Some(now),
         }
     }
+
+    /// Return the resolved AWS SigV4 region. If the profile has an explicit region
+    /// configured that is not "auto" or empty, use it. If it is "auto" or empty,
+    /// attempt to infer the region from known S3-compatible provider endpoint URLs
+    /// (e.g. Backblaze B2, Wasabi, DigitalOcean, Linode) before falling back.
+    pub fn effective_region(&self) -> String {
+        let configured = self
+            .region
+            .as_ref()
+            .map(|r| r.trim())
+            .filter(|r| !r.is_empty());
+
+        if let Some(reg) = configured {
+            if !reg.eq_ignore_ascii_case("auto") {
+                return reg.to_string();
+            }
+        }
+
+        if let CredentialType::CustomEndpoint { endpoint_url, .. } = &self.credential_type {
+            if let Some(inferred) = infer_region_from_endpoint(endpoint_url) {
+                return inferred;
+            }
+            if let Some(reg) = configured {
+                if reg.eq_ignore_ascii_case("auto") {
+                    return "auto".to_string();
+                }
+            }
+        }
+
+        configured
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "us-east-1".to_string())
+    }
+}
+
+/// Infer the S3 signing region from a custom endpoint URL when the user
+/// enters "auto", leaves region blank, or when the endpoint domain encodes the cluster/region.
+pub fn infer_region_from_endpoint(endpoint_url: &str) -> Option<String> {
+    let lower = endpoint_url.to_lowercase();
+    let host = lower
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()?
+        .split(':')
+        .next()?;
+
+    // Backblaze B2: s3.<region>.backblazeb2.com (e.g. s3.us-east-005.backblazeb2.com)
+    if let Some(rest) = host.strip_suffix(".backblazeb2.com") {
+        if let Some(region) = rest.strip_prefix("s3.") {
+            if !region.is_empty() && !region.contains('.') {
+                return Some(region.to_string());
+            }
+        }
+    }
+
+    // Wasabi: s3.<region>.wasabisys.com (e.g. s3.us-east-2.wasabisys.com)
+    if let Some(rest) = host.strip_suffix(".wasabisys.com") {
+        if let Some(region) = rest.strip_prefix("s3.") {
+            if !region.is_empty() && !region.contains('.') {
+                return Some(region.to_string());
+            }
+        }
+    }
+
+    // DigitalOcean Spaces: <region>.digitaloceanspaces.com (e.g. nyc3.digitaloceanspaces.com)
+    if let Some(region) = host.strip_suffix(".digitaloceanspaces.com") {
+        if !region.is_empty() && !region.contains('.') {
+            return Some(region.to_string());
+        }
+    }
+
+    // Linode Object Storage: <region>.linodeobjects.com (e.g. us-east-1.linodeobjects.com)
+    if let Some(region) = host.strip_suffix(".linodeobjects.com") {
+        if !region.is_empty() && !region.contains('.') {
+            return Some(region.to_string());
+        }
+    }
+
+    // Scaleway: s3.<region>.scw.cloud (e.g. s3.fr-par.scw.cloud)
+    if let Some(rest) = host.strip_suffix(".scw.cloud") {
+        if let Some(region) = rest.strip_prefix("s3.") {
+            if !region.is_empty() && !region.contains('.') {
+                return Some(region.to_string());
+            }
+        }
+    }
+
+    // Vultr: <region>.vultrobjects.com (e.g. ewr1.vultrobjects.com)
+    if let Some(region) = host.strip_suffix(".vultrobjects.com") {
+        if !region.is_empty() && !region.contains('.') {
+            return Some(region.to_string());
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -537,7 +636,7 @@ impl ProfileManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialType, Profile, ProfileManager};
+    use super::{infer_region_from_endpoint, CredentialType, Profile, ProfileManager};
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -762,6 +861,7 @@ mod tests {
                 name: "Legacy".to_string(),
                 credential_type: CredentialType::Environment,
                 region: None,
+                buckets: Vec::new(),
                 is_default: false,
                 created_at: None,
                 updated_at: None,
@@ -917,4 +1017,124 @@ mod tests {
             .contains("Enter a secret access key"));
         assert!(manager.load_secret(&created).unwrap().is_none());
     }
+
+    #[test]
+    fn test_infer_region_from_endpoint() {
+        assert_eq!(
+            infer_region_from_endpoint("https://s3.us-east-005.backblazeb2.com"),
+            Some("us-east-005".to_string())
+        );
+        assert_eq!(
+            infer_region_from_endpoint("https://s3.eu-central-003.backblazeb2.com/"),
+            Some("eu-central-003".to_string())
+        );
+        assert_eq!(
+            infer_region_from_endpoint("https://s3.us-west-004.backblazeb2.com:443"),
+            Some("us-west-004".to_string())
+        );
+        assert_eq!(
+            infer_region_from_endpoint("https://s3.us-east-2.wasabisys.com"),
+            Some("us-east-2".to_string())
+        );
+        assert_eq!(
+            infer_region_from_endpoint("https://nyc3.digitaloceanspaces.com"),
+            Some("nyc3".to_string())
+        );
+        assert_eq!(
+            infer_region_from_endpoint("https://us-east-1.linodeobjects.com"),
+            Some("us-east-1".to_string())
+        );
+        assert_eq!(
+            infer_region_from_endpoint("https://s3.fr-par.scw.cloud"),
+            Some("fr-par".to_string())
+        );
+        assert_eq!(
+            infer_region_from_endpoint("https://ewr1.vultrobjects.com"),
+            Some("ewr1".to_string())
+        );
+        // Cloudflare R2 / MinIO should not infer a region
+        assert_eq!(
+            infer_region_from_endpoint("https://abc12345.r2.cloudflarestorage.com"),
+            None
+        );
+        assert_eq!(
+            infer_region_from_endpoint("http://localhost:9000"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_profile_effective_region_auto_inference() {
+        // When region is "auto" on Backblaze B2, infer "us-east-005"
+        let b2_profile = Profile::new(
+            "B2".to_string(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: "https://s3.us-east-005.backblazeb2.com".to_string(),
+                access_key_id: "key".to_string(),
+                secret_access_key: "sec".to_string(),
+            },
+            Some("auto".to_string()),
+        );
+        assert_eq!(b2_profile.effective_region(), "us-east-005");
+
+        // When region is empty on Backblaze B2, infer "us-east-005"
+        let b2_empty = Profile::new(
+            "B2".to_string(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: "https://s3.us-east-005.backblazeb2.com".to_string(),
+                access_key_id: "key".to_string(),
+                secret_access_key: "sec".to_string(),
+            },
+            None,
+        );
+        assert_eq!(b2_empty.effective_region(), "us-east-005");
+
+        // Explicit non-auto region overrides inference
+        let b2_explicit = Profile::new(
+            "B2".to_string(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: "https://s3.us-east-005.backblazeb2.com".to_string(),
+                access_key_id: "key".to_string(),
+                secret_access_key: "sec".to_string(),
+            },
+            Some("custom-override".to_string()),
+        );
+        assert_eq!(b2_explicit.effective_region(), "custom-override");
+
+        // Cloudflare R2 with "auto" preserves "auto"
+        let r2_profile = Profile::new(
+            "R2".to_string(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: "https://abc.r2.cloudflarestorage.com".to_string(),
+                access_key_id: "key".to_string(),
+                secret_access_key: "sec".to_string(),
+            },
+            Some("auto".to_string()),
+        );
+        assert_eq!(r2_profile.effective_region(), "auto");
+    }
+
+    #[test]
+    fn test_profile_buckets_serialization_and_legacy_compatibility() {
+        // Deserializing legacy profile without "buckets" field defaults to empty Vec
+        let legacy_json = r#"{
+            "id": "p-1",
+            "name": "Legacy Profile",
+            "credential_type": { "type": "Environment" },
+            "region": "us-east-1",
+            "is_default": true
+        }"#;
+
+        let profile: Profile = serde_json::from_str(legacy_json).unwrap();
+        assert!(profile.buckets.is_empty());
+
+        // Serializing and deserializing profile with buckets
+        let mut with_buckets = profile;
+        with_buckets.buckets = vec!["bucket-alpha".to_string(), "bucket-beta".to_string()];
+
+        let json = serde_json::to_string(&with_buckets).unwrap();
+        let parsed: Profile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.buckets, vec!["bucket-alpha", "bucket-beta"]);
+    }
 }
+
